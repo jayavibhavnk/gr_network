@@ -13,3 +13,4 @@ autogen
 langchain-community
 youtube-transcript-api
 kreuzberg
+validators
