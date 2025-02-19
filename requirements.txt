@@ -10,3 +10,4 @@ python-dotenv
 sentence-transformers
 faiss-cpu
 autogen
+langchain-community
