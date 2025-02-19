@@ -2,48 +2,55 @@
 import os
 import streamlit as st
 import requests
-import validators
 from bs4 import BeautifulSoup
 import networkx as nx
 from urllib.parse import urlparse
-import pickle
-from youtube_transcript_api import YouTubeTranscriptApi
+from autogen import AssistantAgent, UserProxyAgent
+import json
+import difflib
+from datetime import datetime
 from pyvis.network import Network
-from langchain_groq import ChatGroq
 from langchain_community.vectorstores import FAISS
+from langchain_groq import ChatGroq
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-from kreuzberg import extract_file  # From search result [1]
 
-# Configuration
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-SAVE_FILE = "app_state.pkl"
+# Groq Configuration
+config_list = [{
+    "model": "mixtral-8x7b-32768",
+    "api_key": os.environ.get("GROQ_API_KEY", "your-key-here"),
+    "base_url": "https://api.groq.com/openai/v1",
+    "api_type": "open_ai"
+}]
 
 class WebKnowledgeGraphAgent:
     def __init__(self):
         self.graph = nx.Graph()
-        self.processed_urls = set()
-        self.content_store = []
-
-    def process_url(self, url):
-        if url in self.processed_urls:
-            return
-            
-        try:
-            if "youtube.com" in url or "youtu.be" in url:
-                content = self.process_youtube(url)
-            elif url.lower().endswith('.pdf'):
-                content = self.process_pdf(url)
-            else:
-                content = self.scrape_website(url)
-                
-            if content:
-                self.content_store.append({"url": url, "content": content})
-                self.processed_urls.add(url)
-                
-        except Exception as e:
-            st.error(f"Error processing {url}: {str(e)}")
+        self.analyzer = AssistantAgent(
+            name="analyzer",
+            system_message="""Analyze web content and return JSON with:
+- "concepts": [{"id", "name", "type", "time?", "parent?"}]
+- "relationships": [{"source", "target", "label"}]
+Example:
+{
+  "concepts": [
+    {"id": "1", "name": "AI", "type": "concept"},
+    {"id": "2", "name": "ML", "type": "concept", "parent": "1"}
+  ],
+  "relationships": [
+    {"source": "1", "target": "2", "label": "subfield"}
+  ]
+}""",
+            llm_config={"config_list": config_list, "temperature": 0.1}
+        )
+        self.user_proxy = UserProxyAgent(
+            name="user_proxy",
+            human_input_mode="NEVER",
+            max_consecutive_auto_reply=0,
+            code_execution_config=False
+        )
+        self.concept_similarity_threshold = 0.75
 
     def scrape_website(self, url):
         try:
@@ -55,133 +62,108 @@ class WebKnowledgeGraphAgent:
             st.error(f"Scraping error: {e}")
             return None
 
-    def process_pdf(self, file_path):
-        try:
-            result = extract_file(file_path)
-            return result.content
-        except Exception as e:
-            st.error(f"PDF processing error: {e}")
-            return None
+    def process_websites(self, urls):
+        for url in urls:
+            content = self.scrape_website(url)
+            if content:
+                data = self.analyze_content(content)
+                self.add_to_graph(url, data)
+        return self.graph
 
-    def process_youtube(self, url):
+    def analyze_content(self, content):
         try:
-            video_id = url.split("v=")[-1].split("&")[0]
-            transcript = YouTubeTranscriptApi.get_transcript(video_id)
-            return " ".join([t['text'] for t in transcript])
+            response = self.user_proxy.initiate_chat(
+                self.analyzer,
+                message=f"Analyze this content:\n{content}",
+                summary_method="last_msg"
+            )
+            return json.loads(response.summary)
         except Exception as e:
-            st.error(f"YouTube transcript error: {e}")
-            return None
+            st.error(f"Analysis failed: {e}")
+            return {"concepts": [], "relationships": []}
+
+    def add_to_graph(self, url, data):
+        domain = urlparse(url).netloc
+        for concept in data.get("concepts", []):
+            self.graph.add_node(
+                concept["id"],
+                name=concept["name"],
+                domain=domain,
+                type=concept.get("type", "concept")
+            )
+        for rel in data.get("relationships", []):
+            self.graph.add_edge(
+                rel["source"],
+                rel["target"],
+                label=rel.get("label", "related")
+            )
 
 class KGRAGApp:
     def __init__(self):
         self.agent = WebKnowledgeGraphAgent()
         self.vectorstore = None
-        self.load_data()
+        self.scraped_content = []
 
     def process_urls(self, urls):
-        valid_urls = [u for u in urls if validators.url(u)]
-        invalid_urls = set(urls) - set(valid_urls)
-        
-        with st.status("Processing..."):
-            for url in valid_urls:
-                self.agent.process_url(url)
-            
+        with st.spinner("Building knowledge graph..."):
+            self.agent.process_websites(urls)
+            self.scraped_content = [
+                {"url": url, "content": self.agent.scrape_website(url)} 
+                for url in urls
+            ]
             embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-            texts = [f"{doc['url']}\n{doc['content']}" for doc in self.agent.content_store]
+            texts = [f"{doc['url']}\n{doc['content']}" for doc in self.scraped_content]
             self.vectorstore = FAISS.from_texts(texts, embeddings)
-            
-            self.save_data()
-            
-            if invalid_urls:
-                st.warning(f"Skipped invalid URLs: {', '.join(invalid_urls)}")
 
     def visualize_graph(self):
-        net = Network(height="600px", width="100%", notebook=False)
-        for node in self.agent.graph.nodes(data=True):
-            net.add_node(node[0], label=node[1].get('name', node[0]))
+        net = Network(height="600px", width="100%")
+        for node, data in self.agent.graph.nodes(data=True):
+            net.add_node(node, label=data['name'], title=data['domain'])
         for edge in self.agent.graph.edges(data=True):
             net.add_edge(edge[0], edge[1], title=edge[2].get('label', ''))
         net.save_graph("graph.html")
         with open("graph.html") as f:
             st.components.v1.html(f.read(), height=800)
 
-    def rag_qa(self, question):
+    def ask_question(self, question):
         if not self.vectorstore:
-            st.error("Process some content first!")
+            st.error("Process URLs first!")
             return
             
-        prompt_template = """Answer using this context:
-        {context}
-        
-        Question: {question}
-        Cite sources using [URL] notation."""
-        
         qa_chain = RetrievalQA.from_chain_type(
             ChatGroq(temperature=0, model_name="mixtral-8x7b-32768"),
             retriever=self.vectorstore.as_retriever(),
-            chain_type_kwargs={"prompt": PromptTemplate.from_template(prompt_template)}
+            chain_type_kwargs={"prompt": PromptTemplate.from_template(
+                "Answer using this context:\n{context}\n\nQuestion: {question}"
+            )}
         )
-        
         result = qa_chain.invoke({"query": question})
         st.markdown(f"**Answer:** {result['result']}")
-        
-        sources = {doc.metadata['source'] for doc in result.get('source_documents', [])}
-        if sources:
-            st.markdown("**Sources:**")
-            for src in sources:
-                st.markdown(f"- {src}")
-
-    def save_data(self):
-        with open(SAVE_FILE, "wb") as f:
-            pickle.dump({
-                "graph": self.agent.graph,
-                "content_store": self.agent.content_store,
-                "processed_urls": self.agent.processed_urls
-            }, f)
-
-    def load_data(self):
-        if os.path.exists(SAVE_FILE):
-            with open(SAVE_FILE, "rb") as f:
-                data = pickle.load(f)
-                self.agent.graph = data["graph"]
-                self.agent.content_store = data["content_store"]
-                self.agent.processed_urls = data["processed_urls"]
 
 def main():
-    st.set_page_config(page_title="Smart RAG Explorer", layout="wide")
+    st.set_page_config(page_title="KG+RAG App", layout="wide")
+    st.title("Knowledge Graph & RAG Explorer")
+    
     app = KGRAGApp()
     
-    st.title("🧠 Smart Content Analyzer with Groq")
-    
     with st.sidebar:
-        st.header("⚙️ Input Sources")
-        urls = st.text_area("Enter URLs (YouTube, PDFs, websites)", height=150).split("\n")
-        pdf_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
-        
-        if st.button("Process Content"):
-            all_urls = [u.strip() for u in urls if u.strip()]
-            all_urls += [f.name for f in pdf_files]  # Handle uploaded PDFs
-            app.process_urls(all_urls)
-            
-        if st.button("Clear Session"):
-            if os.path.exists(SAVE_FILE):
-                os.remove(SAVE_FILE)
-            st.session_state.clear()
-            st.rerun()
+        st.header("Configuration")
+        urls = st.text_area("Enter URLs (one per line)", height=150)
+        if st.button("Process URLs"):
+            app.process_urls(urls.split("\n"))
     
-    tab1, tab2 = st.tabs(["📊 Knowledge Graph", "❓ QA System"])
+    tab1, tab2 = st.tabs(["Knowledge Graph", "QA System"])
     
     with tab1:
-        if app.agent.processed_urls:
-            st.subheader(f"Processed {len(app.agent.processed_urls)} sources")
+        if app.agent.graph.nodes:
             app.visualize_graph()
         else:
-            st.info("Add content to build the knowledge graph")
+            st.info("Add URLs to build the knowledge graph")
     
     with tab2:
-        question = st.text_input("Ask about the processed content")
+        question = st.text_input("Ask a question about the content")
         if question:
-            app.rag_qa(question)
+            app.ask_question(question)
 
 if __name__ == "__main__":
     main()
