@@ -1,0 +1,10 @@
+# requirements.txt
+streamlit
+pyvis
+langchain
+langchain-openai
+faiss-cpu
+beautifulsoup4
+requests
+networkx
+python-dotenv
