@@ -2,10 +2,10 @@
 streamlit
 pyvis
 langchain
-langchain-openai
-faiss-cpu
+langchain-groq
 beautifulsoup4
 requests
 networkx
 python-dotenv
-groq
+sentence-transformers
+faiss-cpu
