@@ -1,158 +1,169 @@
 # kg_rag_app.py
 import os
 import streamlit as st
-from web_knowledge_graph_agent import WebKnowledgeGraphAgent
+import requests
+from bs4 import BeautifulSoup
+import networkx as nx
+from urllib.parse import urlparse
+from autogen import AssistantAgent, UserProxyAgent
+import json
+import difflib
+from datetime import datetime
+from pyvis.network import Network
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-from pyvis.network import Network
-from typing import List, Dict
+
+# Groq Configuration
+config_list = [{
+    "model": "mixtral-8x7b-32768",
+    "api_key": os.environ.get("GROQ_API_KEY", "your-key-here"),
+    "base_url": "https://api.groq.com/openai/v1",
+    "api_type": "open_ai"
+}]
+
+class WebKnowledgeGraphAgent:
+    def __init__(self):
+        self.graph = nx.Graph()
+        self.analyzer = AssistantAgent(
+            name="analyzer",
+            system_message="""Analyze web content and return JSON with:
+- "concepts": [{"id", "name", "type", "time?", "parent?"}]
+- "relationships": [{"source", "target", "label"}]
+Example:
+{
+  "concepts": [
+    {"id": "1", "name": "AI", "type": "concept"},
+    {"id": "2", "name": "ML", "type": "concept", "parent": "1"}
+  ],
+  "relationships": [
+    {"source": "1", "target": "2", "label": "subfield"}
+  ]
+}""",
+            llm_config={"config_list": config_list, "temperature": 0.1}
+        )
+        self.user_proxy = UserProxyAgent(
+            name="user_proxy",
+            human_input_mode="NEVER",
+            max_consecutive_auto_reply=0,
+            code_execution_config=False
+        )
+        self.concept_similarity_threshold = 0.75
+
+    def scrape_website(self, url):
+        try:
+            response = requests.get(url, timeout=15)
+            soup = BeautifulSoup(response.content, 'html.parser')
+            main_content = soup.find(['main', 'article']) or soup
+            return ' '.join(main_content.stripped_strings)[:4000]
+        except Exception as e:
+            st.error(f"Scraping error: {e}")
+            return None
+
+    def process_websites(self, urls):
+        for url in urls:
+            content = self.scrape_website(url)
+            if content:
+                data = self.analyze_content(content)
+                self.add_to_graph(url, data)
+        return self.graph
+
+    def analyze_content(self, content):
+        try:
+            response = self.user_proxy.initiate_chat(
+                self.analyzer,
+                message=f"Analyze this content:\n{content}",
+                summary_method="last_msg"
+            )
+            return json.loads(response.summary)
+        except Exception as e:
+            st.error(f"Analysis failed: {e}")
+            return {"concepts": [], "relationships": []}
+
+    def add_to_graph(self, url, data):
+        domain = urlparse(url).netloc
+        for concept in data.get("concepts", []):
+            self.graph.add_node(
+                concept["id"],
+                name=concept["name"],
+                domain=domain,
+                type=concept.get("type", "concept")
+            )
+        for rel in data.get("relationships", []):
+            self.graph.add_edge(
+                rel["source"],
+                rel["target"],
+                label=rel.get("label", "related")
+            )
 
 class KGRAGApp:
     def __init__(self):
         self.agent = WebKnowledgeGraphAgent()
         self.vectorstore = None
         self.scraped_content = []
-        
-        if not os.environ.get("GROQ_API_KEY"):
-            st.error("Please set GROQ_API_KEY environment variable")
-            st.stop()
 
-    def process_urls(self, urls: List[str]):
-        with st.status("Processing URLs..."):
-            # Process URLs through knowledge graph agent
+    def process_urls(self, urls):
+        with st.spinner("Building knowledge graph..."):
             self.agent.process_websites(urls)
-            
-            # Store content for RAG
             self.scraped_content = [
                 {"url": url, "content": self.agent.scrape_website(url)} 
                 for url in urls
             ]
-            
-            # Create vector store with Hugging Face embeddings
             embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-            texts = [f"URL: {doc['url']}\nContent: {doc['content']}" for doc in self.scraped_content]
+            texts = [f"{doc['url']}\n{doc['content']}" for doc in self.scraped_content]
             self.vectorstore = FAISS.from_texts(texts, embeddings)
-            
-            st.session_state.processed = True
 
     def visualize_graph(self):
-        net = Network(height="600px", width="100%", notebook=False)
-        
+        net = Network(height="600px", width="100%")
         for node, data in self.agent.graph.nodes(data=True):
-            net.add_node(node, 
-                        label=data['name'], 
-                        title=f"Type: {data.get('type', 'concept')}\nDomain: {data.get('domain', '')}",
-                        group=data.get('type', 'concept'))
-            
+            net.add_node(node, label=data['name'], title=data['domain'])
         for edge in self.agent.graph.edges(data=True):
             net.add_edge(edge[0], edge[1], title=edge[2].get('label', ''))
-        
-        net.save_graph("knowledge_graph.html")
-        with open("knowledge_graph.html", "r") as f:
-            html = f.read()
-        
-        st.components.v1.html(html, height=800)
+        net.save_graph("graph.html")
+        with open("graph.html") as f:
+            st.components.v1.html(f.read(), height=800)
 
-    def rag_qa(self, question: str):
+    def ask_question(self, question):
         if not self.vectorstore:
-            st.error("Process some URLs first!")
+            st.error("Process URLs first!")
             return
             
-        prompt_template = """Use the following context to answer the question.
-        Cite sources using [URL] notation. If unsure, say you don't know.
-        
-        Context:
-        {context}
-        
-        Question: {question}
-        Answer:"""
-        
-        qa_prompt = PromptTemplate(
-            template=prompt_template,
-            input_variables=["context", "question"]
-        )
-        
-        llm = ChatGroq(
-            temperature=0.1,
-            model_name="mixtral-8x7b-32768",
-            api_key=os.environ["GROQ_API_KEY"]
-        )
-        
-        qa = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",
+        qa_chain = RetrievalQA.from_chain_type(
+            ChatGroq(temperature=0, model_name="mixtral-8x7b-32768"),
             retriever=self.vectorstore.as_retriever(),
-            return_source_documents=True,
-            chain_type_kwargs={"prompt": qa_prompt}
+            chain_type_kwargs={"prompt": PromptTemplate.from_template(
+                "Answer using this context:\n{context}\n\nQuestion: {question}"
+            )}
         )
-        
-        result = qa.invoke({"query": question})
+        result = qa_chain.invoke({"query": question})
         st.markdown(f"**Answer:** {result['result']}")
-        
-        if result['source_documents']:
-            st.markdown("**Sources:**")
-            for doc in result['source_documents']:
-                url = doc.metadata.get('source', 'Unknown URL')
-                st.markdown(f"- {url}")
 
 def main():
-    st.set_page_config(page_title="Knowledge Graph Explorer", layout="wide")
+    st.set_page_config(page_title="KG+RAG App", layout="wide")
+    st.title("Knowledge Graph & RAG Explorer")
+    
     app = KGRAGApp()
     
-    st.title("🧠 Knowledge Graph Explorer with Groq")
+    with st.sidebar:
+        st.header("Configuration")
+        urls = st.text_area("Enter URLs (one per line)", height=150)
+        if st.button("Process URLs"):
+            app.process_urls(urls.split("\n"))
     
-    tab1, tab2, tab3 = st.tabs(["Process URLs", "Explore Graph", "QA System"])
+    tab1, tab2 = st.tabs(["Knowledge Graph", "QA System"])
     
     with tab1:
-        st.header("🌐 Process Websites")
-        urls = st.text_area("Enter URLs (one per line)", height=100).split("\n")
-        if st.button("Build Knowledge Graph"):
-            app.process_urls([url.strip() for url in urls if url.strip()])
-            
-        if 'processed' in st.session_state:
-            st.success(f"✅ Graph built with {app.agent.graph.number_of_nodes()} nodes and "
-                      f"{app.agent.graph.number_of_edges()} relationships")
+        if app.agent.graph.nodes:
+            app.visualize_graph()
+        else:
+            st.info("Add URLs to build the knowledge graph")
     
     with tab2:
-        st.header("🔍 Explore Knowledge Graph")
-        if 'processed' in st.session_state:
-            app.visualize_graph()
-            
-            st.subheader("Graph Query Tools")
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                node_query = st.text_input("🔎 Search nodes by name")
-                if node_query:
-                    nodes = [
-                        (n, d) for n, d in app.agent.graph.nodes(data=True)
-                        if node_query.lower() in d['name'].lower()
-                    ]
-                    if nodes:
-                        st.markdown("**Matching Nodes:**")
-                        for node in nodes:
-                            st.markdown(f"- {node[1]['name']} ({node[0]})")
-            
-            with col2:
-                rel_query = st.selectbox("🔗 Filter relationships", 
-                                        ["All", "hierarchy", "similar_concept", "temporal_relation"])
-                if rel_query != "All":
-                    edges = [
-                        (u, v, d) for u, v, d in app.agent.graph.edges(data=True)
-                        if d['label'] == rel_query
-                    ]
-                    st.markdown(f"**Found {len(edges)} {rel_query} relationships**")
-        else:
-            st.info("ℹ️ Process some URLs first!")
-    
-    with tab3:
-        st.header("❓ QA System")
-        question = st.text_input("Ask anything about the scraped content")
+        question = st.text_input("Ask a question about the content")
         if question:
-            app.rag_qa(question)
+            app.ask_question(question)
 
 if __name__ == "__main__":
     main()
